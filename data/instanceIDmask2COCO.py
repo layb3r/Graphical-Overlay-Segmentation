@@ -5,6 +5,15 @@ from pathlib import Path
 from datetime import datetime
 from pycocotools import mask as mask_util
 from PIL import Image
+import os 
+
+# dataset/
+# ├── images/
+# │   ├── image_001.png
+# │   └── ...
+# └── masks/
+#     ├── image_001.png  # 0=background, 1=instance1, 2=instance2, etc.
+#     └── ...
 
 class InstanceIDMaskToCOCO:
     def __init__(self, class_name="overlay_element"):
@@ -61,10 +70,16 @@ class InstanceIDMaskToCOCO:
         # Get unique instance IDs (excluding background=0)
         instance_ids = np.unique(mask)
         instance_ids = instance_ids[instance_ids > 0]
+
+        # print(len(instance_ids))
         
         annotations_added = 0
-        
+
+
+
         for instance_id in instance_ids:
+            # considering concat all of polygons into 1 mask    
+            
             # Create binary mask for this instance
             instance_mask = (mask == instance_id).astype(np.uint8) * 255
             
@@ -91,17 +106,24 @@ class InstanceIDMaskToCOCO:
         
         return annotations_added
     
-    def process_dataset(self, images_folder, masks_folder):
+    def process_dataset(self, img_folder, metadata):
         """Process dataset with instance ID masks"""
-        images_folder = Path(images_folder)
-        masks_folder = Path(masks_folder)
-        
-        image_files = sorted(list(images_folder.glob("*.png")) + 
-                           list(images_folder.glob("*.jpg")))
+        f = open(f"{img_folder}/{metadata}", "r")
+        lines = f.readlines()
+        f.close()
+
+        postfix = []
+        for seq in lines:
+            seq = seq.strip()
+            mask_path = os.path.join(img_folder, 'masks', seq)
+            
+            if os.path.exists(mask_path):
+                postfix.extend([f"{seq}\{imgs}" for imgs in os.listdir(mask_path)])
         
         total_instances = 0
         
-        for image_path in image_files:
+        for post in postfix:
+            image_path = os.path.join(img_folder, "sequences", post)
             img = cv2.imread(str(image_path))
             if img is None:
                 continue
@@ -111,7 +133,7 @@ class InstanceIDMaskToCOCO:
             # Add image
             self.coco_format["images"].append({
                 "id": self.image_id,
-                "file_name": image_path.name,
+                "file_name": image_path,
                 "width": width,
                 "height": height,
             })
@@ -120,18 +142,15 @@ class InstanceIDMaskToCOCO:
             self.image_id += 1
             
             # Find corresponding mask
-            mask_path = masks_folder / image_path.name
+            mask_path = os.path.join(img_folder, "masks", post)
             
-            if not mask_path.exists():
-                # Try with _mask suffix
-                mask_path = masks_folder / f"{image_path.stem}_mask.png"
-            
-            if mask_path.exists():
-                instances = self.process_instance_mask(mask_path, current_image_id)
-                total_instances += instances
-                print(f"  {image_path.name}: {instances} instances")
-            else:
-                print(f"Warning: No mask for {image_path.name}")
+            instances = self.process_instance_mask(mask_path, current_image_id)
+            total_instances += instances
+            print(f"  {image_path}: {instances} instances")
+            # if os.path.isdir(mask_path):
+            #     pass
+            # else:
+            #     print(f"Warning: No mask for {image_path}")
         
         print(f"\nTotal: {self.image_id - 1} images, {total_instances} instances")
     
@@ -153,18 +172,18 @@ if __name__ == "__main__":
     print("Converting training set...")
     converter_train = InstanceIDMaskToCOCO(class_name="overlay_element")
     converter_train.process_dataset(
-        images_folder="dataset/images/train",
-        masks_folder="dataset/masks/train"
+        img_folder = './vimeo-500',
+        metadata = 'train.txt'
     )
     converter_train.save("dataset/coco_annotations/train.json")
     
     print("\n" + "="*50 + "\n")
     
     # For validation set
-    print("Converting validation set...")
-    converter_val = InstanceIDMaskToCOCO(class_name="overlay_element")
-    converter_val.process_dataset(
-        images_folder="dataset/images/val",
-        masks_folder="dataset/masks/val"
-    )
-    converter_val.save("dataset/coco_annotations/val.json")
+    # print("Converting validation set...")
+    # converter_val = InstanceIDMaskToCOCO(class_name="overlay_element")
+    # converter_val.process_dataset(
+    #     images_folder="dataset/images/val",
+    #     masks_folder="dataset/masks/val"
+    # )
+    # converter_val.save("dataset/coco_annotations/val.json")
