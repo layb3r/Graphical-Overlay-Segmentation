@@ -112,11 +112,8 @@ class InstanceIDMaskToCOCO:
         lines = f.readlines()
         f.close()
 
-        postfix = []
-        for seq in lines:
-            seq = seq.strip()
-            mask_path = os.path.join(img_folder, 'masks', seq)
-            postfix.extend([f"{seq}/{imgs}" for imgs in os.listdir(mask_path)])
+        postfix = [seq.strip() for seq in lines]
+
         
         total_instances = 0
         
@@ -158,30 +155,3 @@ class InstanceIDMaskToCOCO:
         with open(output_path, 'w') as f:
             json.dump(self.coco_format, f, indent=2)
         print(f"Saved to {output_path}")
-
-
-if __name__ == "__main__":
-    # Usage for instance ID masks
-    # converter = InstanceIDMaskToCOCO(class_name="overlay_element")
-    # converter.process_dataset("dataset/images/train", "dataset/masks/train")
-    # converter.save("dataset/coco_annotations/train.json")
-
-    # For training set
-    print("Converting training set...")
-    converter_train = InstanceIDMaskToCOCO(class_name="overlay_element")
-    converter_train.process_dataset(
-        img_folder = './vimeo-500',
-        metadata = 'train.txt'
-    )
-    converter_train.save("dataset/coco_annotations/train.json")
-    
-    print("\n" + "="*50 + "\n")
-    
-    # For validation set
-    # print("Converting validation set...")
-    # converter_val = InstanceIDMaskToCOCO(class_name="overlay_element")
-    # converter_val.process_dataset(
-    #     images_folder="dataset/images/val",
-    #     masks_folder="dataset/masks/val"
-    # )
-    # converter_val.save("dataset/coco_annotations/val.json")

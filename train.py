@@ -63,7 +63,13 @@ class COCOInstanceSegmentationDataset(Dataset):
         # Get image info
         img_id = self.image_ids[idx]
         img_info = self.coco.loadImgs(img_id)[0]
-        img_path = self.images_folder / img_info['file_name']
+        
+        # Handle both relative and absolute paths in COCO JSON
+        file_name = img_info['file_name']
+        if Path(file_name).is_absolute():
+            img_path = Path(file_name)
+        else:
+            img_path = self.images_folder / file_name
         
         # Load image
         image = Image.open(img_path).convert('RGB')
@@ -86,7 +92,7 @@ class COCOInstanceSegmentationDataset(Dataset):
         # Apply augmentation if enabled
         if self.transform is not None and len(masks) > 0:
             # Stack masks for augmentation
-            masks_np = np.stack(masks, axis=-1) if len(masks) > 0 else np.zeros((image_np.shape[0], image_np.shape[1], 0))
+            masks_np = np.stack(masks, axis=-1)
             
             transformed = self.transform(
                 image=image_np,
@@ -94,35 +100,39 @@ class COCOInstanceSegmentationDataset(Dataset):
             )
             
             image_np = transformed['image']
-            masks = transformed['masks']
+            # Convert augmented masks back to numpy arrays
+            masks = [np.array(m) for m in transformed['masks']]
         
         # Convert back to PIL for processor
         image = Image.fromarray(image_np)
         
-        # Prepare instance segmentation map
-        # Each instance gets a unique ID
-        instance_seg_map = np.zeros((image_np.shape[0], image_np.shape[1]), dtype=np.int32)
+        # Process image to get pixel_values and pixel_mask
+        inputs = self.processor(images=image, return_tensors="pt")
         
-        for i, mask in enumerate(masks):
-            instance_seg_map[mask > 0] = i + 1  # Instance IDs start from 1
+        # Prepare mask_labels and class_labels for training
+        # These need to be in the format expected by Mask2Former model
+        if len(masks) > 0:
+            # Convert masks to tensors
+            mask_labels = []
+            for mask in masks:
+                # Ensure mask is binary and convert to tensor
+                binary_mask = torch.from_numpy((np.array(mask) > 0).astype(np.float32))
+                mask_labels.append(binary_mask)
+            
+            # Stack masks into a single tensor [num_instances, H, W]
+            inputs["mask_labels"] = torch.stack(mask_labels)
+            
+            # Class labels as tensor [num_instances]
+            inputs["class_labels"] = torch.tensor(class_labels, dtype=torch.long)
+        else:
+            # Handle images with no annotations
+            # Create dummy tensors with shape [0, H, W] and [0]
+            inputs["mask_labels"] = torch.zeros((0, image_np.shape[0], image_np.shape[1]), dtype=torch.float32)
+            inputs["class_labels"] = torch.zeros(0, dtype=torch.long)
         
-        # Prepare class labels map (same class for all instances in your case)
-        class_labels_map = np.zeros((image_np.shape[0], image_np.shape[1]), dtype=np.int32)
-        
-        for i, (mask, class_id) in enumerate(zip(masks, class_labels)):
-            class_labels_map[mask > 0] = class_id
-        
-        # Process with Mask2Former processor
-        # The processor expects instance and class segmentation maps
-        inputs = self.processor(
-            images=image,
-            segmentation_maps=instance_seg_map,
-            instance_id_to_semantic_id={i + 1: class_labels[i] for i in range(len(class_labels))},
-            return_tensors="pt"
-        )
-        
-        # Remove batch dimension
-        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
+        # Remove batch dimension from pixel_values and pixel_mask
+        inputs["pixel_values"] = inputs["pixel_values"].squeeze(0)
+        inputs["pixel_mask"] = inputs["pixel_mask"].squeeze(0)
         
         return inputs
 
@@ -255,7 +265,7 @@ def train_mask2former(
         per_device_eval_batch_size=batch_size,
         learning_rate=learning_rate,
         weight_decay=0.01,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=save_steps,
@@ -298,13 +308,15 @@ def train_mask2former(
 
 if __name__ == "__main__":
     # Configuration
-    TRAIN_IMAGES = "dataset/images/train"
-    TRAIN_ANNOTATIONS = "dataset/coco_annotations/train.json"
-    VAL_IMAGES = "dataset/images/val"
-    VAL_ANNOTATIONS = "dataset/coco_annotations/val.json"
+    # Note: TRAIN_IMAGES should point to the root directory where image paths in COCO JSON are relative to
+    # Since COCO JSON has paths like "./vimeo-500/sequences/...", set this to the data folder
+    TRAIN_IMAGES = "data"  # Images are in data/vimeo-500/sequences/
+    TRAIN_ANNOTATIONS = "../dataset/coco_annotations/train.json"
+    VAL_IMAGES = "data"  # Images are in data/vimeo-500/sequences/
+    VAL_ANNOTATIONS = "../dataset/coco_annotations/val.json"
     
     OUTPUT_DIR = "./mask2former-overlay-segmentation"
-    NUM_CLASSES = 1  # Single class: 
+    NUM_CLASSES = 1  # Single class: overlay_element 
     
     # # Smaller, faster (recommended for starting)
     # PRETRAINED_MODEL = "facebook/mask2former-swin-tiny-coco-instance"
