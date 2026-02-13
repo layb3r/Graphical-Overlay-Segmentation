@@ -2,13 +2,14 @@ from pycocotools.coco import COCO
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # Single class segmentation
 
 def create_COCO(isBinary=False):
     pass
 
-def visualize_coco_annotations(json_path, images_folder, num_samples=3):
+def visualize_coco_annotations(json_path, num_samples=3):
     """Visualize COCO annotations to verify conversion"""
     coco = COCO(json_path)
     
@@ -22,7 +23,7 @@ def visualize_coco_annotations(json_path, images_folder, num_samples=3):
     
     for img_id in img_ids:
         img_info = coco.loadImgs(img_id)[0]
-        img_path = Path(images_folder) / img_info['file_name']
+        img_path = img_info['file_name']
         
         img = cv2.imread(str(img_path))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
