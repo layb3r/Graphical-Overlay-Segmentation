@@ -116,9 +116,7 @@ class InstanceIDMaskToCOCO:
         for seq in lines:
             seq = seq.strip()
             mask_path = os.path.join(img_folder, 'masks', seq)
-            
-            if os.path.exists(mask_path):
-                postfix.extend([f"{seq}\{imgs}" for imgs in os.listdir(mask_path)])
+            postfix.extend([f"{seq}/{imgs}" for imgs in os.listdir(mask_path)])
         
         total_instances = 0
         
