@@ -1,0 +1,17 @@
+# goons/
+# ├── images/
+#      └── train
+#      └── val
+# ├── labels/
+#      └── train
+#      └── val
+
+path: goons # dataset root dir
+train: images/train 
+val: images/val
+test: 
+
+# Classes
+names:
+  0: ui
+
