@@ -43,7 +43,7 @@ def process_masks_to_yolo(input_base_dir, output_base_dir, class_id=0):
     output_base = Path(output_base_dir)
     
     # Process both train and val splits
-    for split in ['train', 'val']:
+    for split in ['train', 'val', 'test']:
         print(f"\nProcessing {split} split...")
         
         images_input = input_base / split / 'images'
