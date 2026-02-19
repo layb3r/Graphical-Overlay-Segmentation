@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from PIL import Image
+import cv2
 from pathlib import Path
 import shutil
 
@@ -66,7 +66,11 @@ def process_masks_to_yolo(input_base_dir, output_base_dir, class_id=0):
         
         for mask_path in mask_files:
             # Read mask
-            mask = np.array(Image.open(mask_path))
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            
+            if mask is None:
+                print(f"Warning: Could not read mask: {mask_path}")
+                continue
             
             # Get unique instance IDs (excluding background, assumed to be 0)
             instance_ids = np.unique(mask)
@@ -103,7 +107,6 @@ def process_masks_to_yolo(input_base_dir, output_base_dir, class_id=0):
     
     print("\nConversion complete!")
     print(f"Output directory: {output_base}")
-    print(f"\nYou can now use this structure with your YAML file.")
 
 if __name__ == "__main__":
     # Configuration
