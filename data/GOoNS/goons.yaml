@@ -13,5 +13,4 @@ test: images/test
 
 # Classes
 names:
-  0: ui
-
+  0: go
