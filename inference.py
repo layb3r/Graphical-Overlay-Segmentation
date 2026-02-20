@@ -2,15 +2,18 @@ import argparse
 from pathlib import Path
 import cv2
 import numpy as np
-from ultralytics import YOLO, FastSAM
-from ultralytics.models.fastsam import FastSAMPrompt
+from ultralytics import YOLO
+import torch
 import time
+from torchvision import transforms
+from efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
+import zipfile
 
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run combined YOLO + FastSAM inference for graphical overlay segmentation",
+        description="Run combined YOLO + EfficientSAM inference for graphical overlay segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -23,10 +26,18 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--fastsam-model",
+        "--sam-type",
         type=str,
-        default="./weights/FastSAM-x.pt",
-        help="Path to FastSAM model weights (.pt file)"
+        default="vitt",
+        choices=["vitt", "vits"],
+        help="EfficientSAM model type (vitt=tiny, vits=small)"
+    )
+    
+    parser.add_argument(
+        "--sam-model",
+        type=str,
+        default="./weights/efficient_sam_vitt.pt",
+        help="Path to EfficientSAM model weights (.pt or .pt.zip file)"
     )
     
     # Input configuration
@@ -42,7 +53,7 @@ def parse_args():
         "--imgsz",
         type=int,
         default=1024,
-        help="Inference image size (FastSAM typically uses 1024)"
+        help="Inference image size for EfficientSAM (not used, kept for compatibility)"
     )
     
     parser.add_argument(
@@ -56,7 +67,7 @@ def parse_args():
         "--iou",
         type=float,
         default=0.9,
-        help="IoU threshold for NMS in FastSAM"
+        help="IoU threshold for NMS (not used by EfficientSAM, kept for compatibility)"
     )
     
     parser.add_argument(
@@ -69,7 +80,7 @@ def parse_args():
     parser.add_argument(
         "--retina",
         action="store_true",
-        help="Use retina masks for higher quality FastSAM output"
+        help="Not used with EfficientSAM (kept for compatibility)"
     )
     
     # Visualization options
@@ -96,14 +107,14 @@ def parse_args():
     parser.add_argument(
         "--save-masks",
         action="store_true",
-        help="Save individual mask files"
+        help="Save individual mask files separately (in individual_masks subfolder)"
     )
     
     parser.add_argument(
         "--save-overlay",
         action="store_true",
         default=True,
-        help="Save overlay visualization"
+        help="Save combined visualization (masks + boxes together)"
     )
     
     parser.add_argument(
@@ -198,60 +209,276 @@ def get_boxes_from_yolo(yolo_model, image, conf_threshold, device):
     return boxes, confidences, class_ids
 
 
-def run_fastsam_with_boxes(fastsam_model, image, boxes, iou_threshold, device, retina=False):
+def run_efficient_sam_with_boxes(sam_model, image, boxes, device):
     """
-    Run FastSAM with box prompts from YOLO detections.
+    Run EfficientSAM with box prompts from YOLO detections.
+    Uses box encoding directly for efficient segmentation.
     
     Args:
-        fastsam_model: FastSAM model instance
-        image: Input image (numpy array)
+        sam_model: EfficientSAM model instance
+        image: Input image (numpy array, BGR format)
         boxes: Bounding boxes from YOLO in xyxy format
-        iou_threshold: IoU threshold for FastSAM
         device: Device to run on
-        retina: Use retina masks
         
     Returns:
-        masks: Segmentation masks
-        fastsam_results: Full FastSAM results
+        masks: Segmentation masks (list of numpy arrays)
+        predicted_ious: IoU scores for each mask
     """
-    # Run FastSAM
-    fastsam_results = fastsam_model(
-        image,
-        device=device,
-        retina_masks=retina,
-        iou=iou_threshold,
-        conf=0.4,
-        verbose=False
-    )
+    # Get original image dimensions
+    orig_h, orig_w = image.shape[:2]
     
-    if len(fastsam_results) == 0:
-        return None, None
+    # Convert BGR to RGB
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
-    # Create prompt processor
-    prompt_process = FastSAMPrompt(image, fastsam_results, device=device)
+    # Convert to tensor
+    image_tensor = transforms.ToTensor()(image_rgb)
     
-    # Use box prompts
-    # Convert boxes to list format expected by FastSAM
-    box_prompts = boxes.tolist() if len(boxes) > 0 else None
+    # Move to device
+    image_tensor = image_tensor.to(device)
+    sam_model = sam_model.to(device)
     
-    if box_prompts is None:
-        return None, None
+    selected_masks = []
+    predicted_ious = []
     
-    # Get masks using box prompts
-    masks = prompt_process.box_prompt(bboxes=box_prompts)
+    # Process each box
+    for box in boxes:
+        x1, y1, x2, y2 = box.astype(float)
+        
+        # Ensure coordinates are within image bounds
+        x1 = max(0, min(x1, orig_w - 1))
+        x2 = max(0, min(x2, orig_w - 1))
+        y1 = max(0, min(y1, orig_h - 1))
+        y2 = max(0, min(y2, orig_h - 1))
+        
+        # Skip invalid boxes
+        if x2 <= x1 or y2 <= y1:
+            mask = np.zeros((orig_h, orig_w), dtype=bool)
+            selected_masks.append(mask)
+            predicted_ious.append(0.0)
+            continue
+        
+        # Convert box to two corner points for EfficientSAM
+        # Using top-left and bottom-right corners
+        input_points = torch.tensor([[[[x1, y1], [x2, y2]]]]).to(device)
+        input_labels = torch.tensor([[[2, 3]]]).to(device)  # 2 and 3 indicate box corners
+        
+        try:
+            # Run EfficientSAM inference
+            with torch.no_grad():
+                predicted_logits, predicted_iou = sam_model(
+                    image_tensor[None, ...],
+                    input_points,
+                    input_labels,
+                )
+            
+            # Sort by IoU and get best mask
+            sorted_ids = torch.argsort(predicted_iou, dim=-1, descending=True)
+            predicted_iou = torch.take_along_dim(predicted_iou, sorted_ids, dim=2)
+            predicted_logits = torch.take_along_dim(
+                predicted_logits, sorted_ids[..., None, None], dim=2
+            )
+            
+            # Get the mask with highest IoU
+            mask = torch.ge(predicted_logits[0, 0, 0, :, :], 0).cpu().detach().numpy()
+            iou = predicted_iou[0, 0, 0].cpu().item()
+            
+            selected_masks.append(mask.astype(bool))
+            predicted_ious.append(iou)
+            
+        except Exception as e:
+            print(f"Warning: EfficientSAM failed for box {box}: {e}")
+            # Fallback: create simple box mask
+            mask = np.zeros((orig_h, orig_w), dtype=bool)
+            mask[int(y1):int(y2), int(x1):int(x2)] = True
+            selected_masks.append(mask)
+            predicted_ious.append(0.0)
     
-    return masks, fastsam_results
+    return selected_masks, predicted_ious
+
+
+def load_efficient_sam_model(model_type, model_path, device):
+    """
+    Load EfficientSAM model.
+    
+    Args:
+        model_type: Model type ('vitt' or 'vits')
+        model_path: Path to model weights
+        device: Device to load model on
+        
+    Returns:
+        model: Loaded EfficientSAM model
+    """
+    model_path = Path(model_path)
+    
+    # Handle .zip files
+    if model_path.suffix == '.zip' or str(model_path).endswith('.pt.zip'):
+        print(f"Extracting model from zip file: {model_path}")
+        with zipfile.ZipFile(model_path, 'r') as zip_ref:
+            # Extract to the same directory
+            zip_ref.extractall(model_path.parent)
+        # Update path to extracted file
+        model_path = model_path.parent / model_path.stem
+        if model_path.suffix == '.pt':
+            # Already has .pt extension
+            pass
+        else:
+            # Add .pt extension
+            model_path = Path(str(model_path) + '.pt')
+    
+    if not model_path.exists():
+        raise FileNotFoundError(f"EfficientSAM model file not found: {model_path}")
+    
+    # Build model based on type
+    if model_type == 'vitt':
+        model = build_efficient_sam_vitt(checkpoint=str(model_path))
+    elif model_type == 'vits':
+        model = build_efficient_sam_vits(checkpoint=str(model_path))
+    else:
+        raise ValueError(f"Unknown EfficientSAM model type: {model_type}")
+    
+    model = model.to(device)
+    model.eval()
+    
+    return model
+
+
+def get_colors(num_detections, seed=42):
+    """Generate consistent colors for detections."""
+    np.random.seed(seed)
+    return np.random.randint(0, 255, size=(num_detections, 3), dtype=np.uint8)
+
+
+def create_pure_mask(image_shape, masks):
+    """
+    Create pure binary mask visualization (white masks on black background).
+    
+    Args:
+        image_shape: Shape of the original image (H, W, C)
+        masks: List of segmentation masks
+        
+    Returns:
+        mask_image: Binary mask image
+    """
+    h, w = image_shape[:2]
+    mask_image = np.zeros((h, w), dtype=np.uint8)
+    
+    if masks is not None and len(masks) > 0:
+        for mask in masks:
+            if isinstance(mask, np.ndarray):
+                binary_mask = mask.astype(bool)
+            else:
+                binary_mask = mask.cpu().numpy().astype(bool)
+            
+            mask_image[binary_mask] = 255
+    
+    return mask_image
+
+
+def apply_mask_to_image(image, masks, alpha=0.4):
+    """
+    Apply colored masks to the image without bounding boxes.
+    
+    Args:
+        image: Original image
+        masks: List of segmentation masks
+        alpha: Mask transparency
+        
+    Returns:
+        masked_image: Image with colored masks applied
+    """
+    masked_image = image.copy()
+    
+    if masks is not None and len(masks) > 0:
+        colors = get_colors(len(masks))
+        
+        for i, mask in enumerate(masks):
+            color = colors[i].tolist()
+            
+            # Convert mask to binary
+            if isinstance(mask, np.ndarray):
+                binary_mask = mask.astype(bool)
+            else:
+                binary_mask = mask.cpu().numpy().astype(bool)
+            
+            # Apply colored mask
+            for c in range(3):
+                masked_image[:, :, c] = np.where(
+                    binary_mask,
+                    masked_image[:, :, c] * (1 - alpha) + alpha * color[c],
+                    masked_image[:, :, c]
+                )
+    
+    return masked_image
+
+
+def create_detection_output(image, boxes, confidences, class_ids, class_names, line_width=2):
+    """
+    Create detection visualization with only bounding boxes and labels.
+    
+    Args:
+        image: Original image
+        boxes: YOLO bounding boxes
+        confidences: Detection confidences
+        class_ids: Class IDs
+        class_names: Class names dictionary
+        line_width: Box line width
+        
+    Returns:
+        detection_image: Image with bounding boxes and labels
+    """
+    detection_image = image.copy()
+    
+    if boxes is not None and len(boxes) > 0:
+        colors = get_colors(len(boxes))
+        
+        for i, (box, conf, cls_id) in enumerate(zip(boxes, confidences, class_ids)):
+            x1, y1, x2, y2 = box.astype(int)
+            color = colors[i].tolist()
+            
+            # Draw box
+            cv2.rectangle(detection_image, (x1, y1), (x2, y2), color, line_width)
+            
+            # Draw label
+            class_name = class_names.get(cls_id, f"class_{cls_id}")
+            label = f"{class_name} {conf:.2f}"
+            
+            # Get label size
+            (label_w, label_h), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            
+            # Draw label background
+            cv2.rectangle(
+                detection_image,
+                (x1, y1 - label_h - baseline - 5),
+                (x1 + label_w, y1),
+                color,
+                -1
+            )
+            
+            # Draw label text
+            cv2.putText(
+                detection_image,
+                label,
+                (x1, y1 - baseline - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1
+            )
+    
+    return detection_image
 
 
 def visualize_results(image, boxes, masks, confidences, class_ids, class_names, 
                      alpha=0.4, line_width=2):
     """
-    Visualize combined YOLO + FastSAM results.
+    Visualize combined YOLO + EfficientSAM results (masks + bounding boxes).
     
     Args:
         image: Original image
         boxes: YOLO bounding boxes
-        masks: FastSAM segmentation masks
+        masks: EfficientSAM segmentation masks
         confidences: Detection confidences
         class_ids: Class IDs
         class_names: Class names dictionary
@@ -264,8 +491,7 @@ def visualize_results(image, boxes, masks, confidences, class_ids, class_names,
     vis_image = image.copy()
     
     # Generate colors for each detection
-    np.random.seed(42)
-    colors = np.random.randint(0, 255, size=(len(boxes), 3), dtype=np.uint8)
+    colors = get_colors(len(boxes))
     
     # Apply masks
     if masks is not None and len(masks) > 0:
@@ -330,15 +556,16 @@ def visualize_results(image, boxes, masks, confidences, class_ids, class_names,
     return vis_image
 
 
-def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
+def process_image(image_path, yolo_model, sam_model, args, device, save_dir=None):
     """
-    Process a single image with YOLO + FastSAM.
+    Process a single image with YOLO + EfficientSAM.
     
     Args:
         image_path: Path to image file
         yolo_model: YOLO model
-        fastsam_model: FastSAM model
+        sam_model: EfficientSAM model
         args: CLI arguments
+        device: Torch device
         save_dir: Directory to save results
         
     Returns:
@@ -347,7 +574,7 @@ def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
     """
     stats = {
         'yolo_time': 0,
-        'fastsam_time': 0,
+        'sam_time': 0,
         'total_time': 0,
         'num_detections': 0
     }
@@ -367,7 +594,7 @@ def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
         start = time.time()
     
     boxes, confidences, class_ids = get_boxes_from_yolo(
-        yolo_model, image, args.conf, args.device
+        yolo_model, image, args.conf, args.device if args.device else 'cpu'
     )
     
     if args.benchmark:
@@ -380,20 +607,21 @@ def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
     
     stats['num_detections'] = len(boxes)
     
-    # Step 2: FastSAM with box prompts
+    # Step 2: EfficientSAM with box prompts (direct box encoding)
     if args.benchmark:
         start = time.time()
     
-    masks, fastsam_results = run_fastsam_with_boxes(
-        fastsam_model, image, boxes, args.iou, args.device, args.retina
+    masks, predicted_ious = run_efficient_sam_with_boxes(
+        sam_model, image, boxes, device
     )
     
     if args.benchmark:
-        stats['fastsam_time'] = time.time() - start
+        stats['sam_time'] = time.time() - start
     
     # Step 3: Visualize results
     class_names = yolo_model.names if hasattr(yolo_model, 'names') else {}
     
+    # Create combined visualization (masks + boxes)
     vis_image = visualize_results(
         original_image, boxes, masks, confidences, class_ids,
         class_names, args.alpha, args.line_width
@@ -403,14 +631,35 @@ def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
     
     # Save results
     if save_dir and args.save:
-        # Save visualization
-        if args.save_overlay:
-            save_path = save_dir / f"{image_path.stem}_result.jpg"
-            cv2.imwrite(str(save_path), vis_image)
+        image_dir = save_dir / image_path.stem
+        image_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save individual masks
+        # 1. Save pure binary mask (white on black)
+        pure_mask = create_pure_mask(original_image.shape, masks)
+        mask_path = image_dir / f"{image_path.stem}_mask.png"
+        cv2.imwrite(str(mask_path), pure_mask)
+        
+        # 2. Save mask applied to image (colored masks only, no boxes)
+        masked_image = apply_mask_to_image(original_image, masks, args.alpha)
+        masked_path = image_dir / f"{image_path.stem}_masked.jpg"
+        cv2.imwrite(str(masked_path), masked_image)
+        
+        # 3. Save detection output (boxes and labels only, no masks)
+        detection_image = create_detection_output(
+            original_image, boxes, confidences, class_ids,
+            class_names, args.line_width
+        )
+        detection_path = image_dir / f"{image_path.stem}_detection.jpg"
+        cv2.imwrite(str(detection_path), detection_image)
+        
+        # 4. Save combined visualization (optional, if save_overlay is True)
+        if args.save_overlay:
+            combined_path = image_dir / f"{image_path.stem}_combined.jpg"
+            cv2.imwrite(str(combined_path), vis_image)
+        
+        # Save individual masks if requested
         if args.save_masks and masks is not None:
-            masks_dir = save_dir / "masks" / image_path.stem
+            masks_dir = image_dir / "individual_masks"
             masks_dir.mkdir(parents=True, exist_ok=True)
             
             for i, mask in enumerate(masks):
@@ -425,15 +674,16 @@ def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
     return vis_image, stats
 
 
-def process_video(video_path, yolo_model, fastsam_model, args, save_dir=None):
+def process_video(video_path, yolo_model, sam_model, args, device, save_dir=None):
     """
-    Process a video file with YOLO + FastSAM.
+    Process a video file with YOLO + EfficientSAM.
     
     Args:
         video_path: Path to video file
         yolo_model: YOLO model
-        fastsam_model: FastSAM model
+        sam_model: EfficientSAM model
         args: CLI arguments
+        device: Torch device
         save_dir: Directory to save results
     """
     cap = cv2.VideoCapture(str(video_path))
@@ -453,10 +703,28 @@ def process_video(video_path, yolo_model, fastsam_model, args, save_dir=None):
     
     # Setup video writer
     writer = None
+    writer_masked = None
+    writer_detection = None
+    writer_combined = None
+    
     if save_dir and args.save:
-        output_path = save_dir / f"{video_path.stem}_result.mp4"
+        output_dir = save_dir / video_path.stem
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        
+        # Writer for mask applied to image
+        masked_path = output_dir / f"{video_path.stem}_masked.mp4"
+        writer_masked = cv2.VideoWriter(str(masked_path), fourcc, fps, (width, height))
+        
+        # Writer for detection output
+        detection_path = output_dir / f"{video_path.stem}_detection.mp4"
+        writer_detection = cv2.VideoWriter(str(detection_path), fourcc, fps, (width, height))
+        
+        # Writer for combined output (if enabled)
+        if args.save_overlay:
+            combined_path = output_dir / f"{video_path.stem}_combined.mp4"
+            writer_combined = cv2.VideoWriter(str(combined_path), fourcc, fps, (width, height))
     
     frame_count = 0
     total_detections = 0
@@ -469,33 +737,50 @@ def process_video(video_path, yolo_model, fastsam_model, args, save_dir=None):
             
             # Process frame
             boxes, confidences, class_ids = get_boxes_from_yolo(
-                yolo_model, frame, args.conf, args.device
+                yolo_model, frame, args.conf, args.device if args.device else 'cpu'
             )
             
             if boxes is not None and len(boxes) > 0:
                 total_detections += len(boxes)
                 
-                # Run FastSAM
-                masks, _ = run_fastsam_with_boxes(
-                    fastsam_model, frame, boxes, args.iou, args.device, args.retina
+                # Run EfficientSAM
+                masks, _ = run_efficient_sam_with_boxes(
+                    sam_model, frame, boxes, device
                 )
                 
-                # Visualize
+                # Create visualizations
                 class_names = yolo_model.names if hasattr(yolo_model, 'names') else {}
+                
+                # Masked image (masks only)
+                masked_frame = apply_mask_to_image(frame, masks, args.alpha)
+                
+                # Detection output (boxes only)
+                detection_frame = create_detection_output(
+                    frame, boxes, confidences, class_ids,
+                    class_names, args.line_width
+                )
+                
+                # Combined (masks + boxes)
                 vis_frame = visualize_results(
                     frame, boxes, masks, confidences, class_ids,
                     class_names, args.alpha, args.line_width
                 )
             else:
+                masked_frame = frame
+                detection_frame = frame
                 vis_frame = frame
             
-            # Save frame
-            if writer:
-                writer.write(vis_frame)
+            # Save frames
+            if writer_masked:
+                writer_masked.write(masked_frame)
+            if writer_detection:
+                writer_detection.write(detection_frame)
+            if writer_combined:
+                writer_combined.write(vis_frame)
             
             # Show frame
             if args.show:
-                cv2.imshow('YOLO + FastSAM Inference', vis_frame)
+                cv2.imshow('YOLO + EfficientSAM Inference', vis_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             
@@ -505,12 +790,24 @@ def process_video(video_path, yolo_model, fastsam_model, args, save_dir=None):
     
     finally:
         cap.release()
-        if writer:
-            writer.release()
+        if writer_masked:
+            writer_masked.release()
+        if writer_detection:
+            writer_detection.release()
+        if writer_combined:
+            writer_combined.release()
         if args.show:
             cv2.destroyAllWindows()
     
     print(f"Video processing complete: {frame_count} frames, {total_detections} total detections")
+    
+    if save_dir and args.save:
+        output_dir = save_dir / video_path.stem
+        print(f"\nSaved video outputs to: {output_dir}")
+        print("  - *_masked.mp4: Mask applied to video")
+        print("  - *_detection.mp4: Bounding boxes and labels")
+        if args.save_overlay:
+            print("  - *_combined.mp4: Combined masks and boxes")
 
 
 def main():
@@ -519,10 +816,11 @@ def main():
     
     # Print configuration
     print("=" * 70)
-    print("YOLO + FastSAM Combined Inference")
+    print("YOLO + EfficientSAM Combined Inference")
     print("=" * 70)
     print(f"YOLO Model: {args.yolo_model}")
-    print(f"FastSAM Model: {args.fastsam_model}")
+    print(f"EfficientSAM Model: {args.sam_model}")
+    print(f"EfficientSAM Type: {args.sam_type}")
     print(f"Source: {args.source}")
     print(f"Image size: {args.imgsz}")
     print(f"Confidence threshold: {args.conf}")
@@ -534,21 +832,29 @@ def main():
     
     # Verify model files exist
     yolo_path = Path(args.yolo_model)
-    fastsam_path = Path(args.fastsam_model)
+    sam_path = Path(args.sam_model)
     
     if not yolo_path.exists():
         raise FileNotFoundError(f"YOLO model file not found: {args.yolo_model}")
-    if not fastsam_path.exists():
-        raise FileNotFoundError(f"FastSAM model file not found: {args.fastsam_model}")
+    if not sam_path.exists():
+        raise FileNotFoundError(f"EfficientSAM model file not found: {args.sam_model}")
+    
+    # Setup device
+    if args.device:
+        device = torch.device(f"cuda:{args.device}" if args.device.isdigit() else args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"Using device: {device}")
     
     # Load models
     print(f"\nLoading YOLO model: {args.yolo_model}")
     yolo_model = YOLO(args.yolo_model)
     print("YOLO model loaded!")
     
-    print(f"Loading FastSAM model: {args.fastsam_model}")
-    fastsam_model = FastSAM(args.fastsam_model)
-    print("FastSAM model loaded!")
+    print(f"Loading EfficientSAM model: {args.sam_model} (type: {args.sam_type})")
+    sam_model = load_efficient_sam_model(args.sam_type, args.sam_model, device)
+    print("EfficientSAM model loaded!")
     
     # Setup save directory
     save_dir = None
@@ -587,11 +893,11 @@ def main():
         
         if source_path.suffix.lower() in video_extensions:
             # Process video
-            process_video(source_path, yolo_model, fastsam_model, args, save_dir)
+            process_video(source_path, yolo_model, sam_model, args, device, save_dir)
         elif source_path.suffix.lower() in image_extensions:
             # Process single image
             vis_image, stats = process_image(
-                source_path, yolo_model, fastsam_model, args, save_dir
+                source_path, yolo_model, sam_model, args, device, save_dir
             )
             
             if vis_image is not None:
@@ -599,8 +905,17 @@ def main():
                 print(f"  Detections: {stats['num_detections']}")
                 if args.benchmark:
                     print(f"  YOLO time: {stats['yolo_time']:.3f}s")
-                    print(f"  FastSAM time: {stats['fastsam_time']:.3f}s")
+                    print(f"  EfficientSAM time: {stats['sam_time']:.3f}s")
                     print(f"  Total time: {stats['total_time']:.3f}s")
+                
+                if args.save and save_dir:
+                    img_dir = save_dir / source_path.stem
+                    print(f"\n  Saved outputs:")
+                    print(f"    - Binary mask: {img_dir / f'{source_path.stem}_mask.png'}")
+                    print(f"    - Masked image: {img_dir / f'{source_path.stem}_masked.jpg'}")
+                    print(f"    - Detection: {img_dir / f'{source_path.stem}_detection.jpg'}")
+                    if args.save_overlay:
+                        print(f"    - Combined: {img_dir / f'{source_path.stem}_combined.jpg'}")
                 
                 if args.show:
                     cv2.imshow('Result', vis_image)
@@ -627,7 +942,7 @@ def main():
             print(f"\n[{i}/{len(image_files)}] Processing {img_path.name}...")
             
             vis_image, stats = process_image(
-                img_path, yolo_model, fastsam_model, args, save_dir
+                img_path, yolo_model, sam_model, args, save_dir
             )
             
             if vis_image is not None:
@@ -645,11 +960,17 @@ def main():
             print(f"Total detections: {sum(s['num_detections'] for s in all_stats)}")
             if args.benchmark:
                 avg_yolo = np.mean([s['yolo_time'] for s in all_stats])
-                avg_fastsam = np.mean([s['fastsam_time'] for s in all_stats])
+                avg_sam = np.mean([s['sam_time'] for s in all_stats])
                 avg_total = np.mean([s['total_time'] for s in all_stats])
                 print(f"Average YOLO time: {avg_yolo:.3f}s")
-                print(f"Average FastSAM time: {avg_fastsam:.3f}s")
+                print(f"Average EfficientSAM time: {avg_sam:.3f}s")
                 print(f"Average total time: {avg_total:.3f}s")
+            print("\nFor each image, saved:")
+            print("  - *_mask.png: Pure binary mask (white on black)")
+            print("  - *_masked.jpg: Mask applied to original image")
+            print("  - *_detection.jpg: Bounding boxes and labels")
+            if args.save_overlay:
+                print("  - *_combined.jpg: Combined masks and boxes")
             print("=" * 70)
     
     if save_dir:
