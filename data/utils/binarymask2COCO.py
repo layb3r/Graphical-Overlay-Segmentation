@@ -231,27 +231,3 @@ class BinaryMaskToCOCO:
             json.dump(self.coco_format, f, indent=2)
         
         print(f"Saved COCO annotations to {output_path}")
-
-
-# ============= USAGE =============
-
-if __name__ == "__main__":
-    # For training set
-    print("Converting training set...")
-    converter_train = BinaryMaskToCOCO(class_name="overlay_element")
-    converter_train.process_dataset(
-        images_folder="dataset/images/train",
-        masks_folder="dataset/masks/train"
-    )
-    converter_train.save("dataset/coco_annotations/train.json")
-    
-    print("\n" + "="*50 + "\n")
-    
-    # For validation set
-    print("Converting validation set...")
-    converter_val = BinaryMaskToCOCO(class_name="overlay_element")
-    converter_val.process_dataset(
-        images_folder="dataset/images/val",
-        masks_folder="dataset/masks/val"
-    )
-    converter_val.save("dataset/coco_annotations/val.json")

@@ -1,269 +1,662 @@
-import torch
-from transformers import Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
+import argparse
 from pathlib import Path
+import cv2
+import numpy as np
+from ultralytics import YOLO, FastSAM
+from ultralytics.models.fastsam import FastSAMPrompt
+import time
 
-class Mask2FormerInference:
-    def __init__(self, model_path: str, processor_path: str = None, device: str = None):
-        """
-        Load trained Mask2Former model for inference
-        
-        Args:
-            model_path: Path to saved model or checkpoint
-            processor_path: Path to processor (optional). If None, tries to load from model_path.
-                           For checkpoints, use the original pretrained model name or final_model path.
-            device: Device to run on ('cuda' or 'cpu')
-        """
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
-        
-        print(f"Loading model from {model_path}...")
-        try:
-            # Auto-detect processor path if not provided
-            if processor_path is None:
-                processor_path = self._find_processor_path(model_path)
-            
-            print(f"Loading processor from {processor_path}...")
-            self.processor = Mask2FormerImageProcessor.from_pretrained(processor_path)
-            
-            # Load model
-            self.model = Mask2FormerForUniversalSegmentation.from_pretrained(model_path)
-            self.model.to(self.device)
-            self.model.eval()
-            print("Model loaded successfully!")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model from {model_path}: {e}")
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run combined YOLO + FastSAM inference for graphical overlay segmentation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     
-    def _find_processor_path(self, model_path: str) -> str:
-        """
-        Automatically find processor path for checkpoints
-        """
-        model_path = Path(model_path)
-        
-        # Check if preprocessor_config.json exists in model_path
-        if (model_path / "preprocessor_config.json").exists():
-            return str(model_path)
-        
-        # If it's a checkpoint folder, look for processor in parent directory's final_model
-        if "checkpoint" in model_path.name:
-            # Try parent/final_model
-            final_model_path = model_path.parent / "final_model"
-            if (final_model_path / "preprocessor_config.json").exists():
-                print(f"Checkpoint detected. Using processor from {final_model_path}")
-                return str(final_model_path)
-            
-            # Try looking in parent directory itself
-            if (model_path.parent / "preprocessor_config.json").exists():
-                print(f"Checkpoint detected. Using processor from {model_path.parent}")
-                return str(model_path.parent)
-        
-        # Default: try to load from model_path and let it fail with clear error
-        return str(model_path)
+    # Model configuration
+    parser.add_argument(
+        "--yolo-model",
+        type=str,
+        default="./weights/yolo_best.pt",
+        help="Path to trained YOLO detection model weights (.pt file)"
+    )
     
-    def predict(self, image_path: str, threshold: float = 0.5, return_raw: bool = False):
-        """
-        Run inference on an image
-        
-        Args:
-            image_path: Path to image file, PIL Image, or numpy array
-            threshold: Confidence threshold for predictions (default 0.5)
-                      Lower values (e.g., 0.1-0.3) detect more instances but may have false positives
-                      Higher values (e.g., 0.6-0.9) are more conservative
-            return_raw: If True, returns raw model outputs for debugging
-            
-        Returns:
-            dict with 'masks', 'scores', 'image', and optionally 'raw_outputs'
-        """
-        # Handle different input types
-        if isinstance(image_path, str):
-            try:
-                image = Image.open(image_path).convert('RGB')
-            except Exception as e:
-                raise ValueError(f"Failed to load image from {image_path}: {e}")
-        elif isinstance(image_path, Image.Image):
-            image = image_path.convert('RGB')
-        elif isinstance(image_path, np.ndarray):
-            image = Image.fromarray(image_path.astype(np.uint8)).convert('RGB')
-        else:
-            raise TypeError(f"Unsupported image type: {type(image_path)}. Expected str, PIL.Image, or numpy.ndarray")
-        
-        # Process image
-        inputs = self.processor(images=image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Run inference
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        # Post-process outputs
-        results = self.processor.post_process_instance_segmentation(
-            outputs,
-            target_sizes=[image.size[::-1]],  # (height, width)
-            threshold=threshold
-        )[0]
-        
-        # Get unique mask count for debugging
-        masks_array = results['segmentation'].cpu().numpy()
-        unique_instances = len(np.unique(masks_array)) - 1  # Exclude background
-        print(f"Detected {unique_instances} instances with threshold={threshold}")
-        
-        result_dict = {
-            'masks': masks_array,
-            'scores': results.get('scores', None),
-            'image': np.array(image)
-        }
-        
-        if return_raw:
-            result_dict['raw_outputs'] = outputs
-            # Print debugging info
-            if hasattr(outputs, 'class_queries_logits'):
-                print(f"Raw predictions shape: {outputs.class_queries_logits.shape}")
-                print(f"Mask predictions shape: {outputs.masks_queries_logits.shape}")
-        
-        return result_dict
+    parser.add_argument(
+        "--fastsam-model",
+        type=str,
+        default="./weights/FastSAM-x.pt",
+        help="Path to FastSAM model weights (.pt file)"
+    )
     
-    def predict_with_multiple_thresholds(self, image_path: str, thresholds: list = None):
-        """
-        Try multiple thresholds to find best detection
-        
-        Args:
-            image_path: Path to image
-            thresholds: List of thresholds to try (default: [0.1, 0.3, 0.5, 0.7, 0.9])
-        """
-        if thresholds is None:
-            thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
-        
-        print("\nTrying multiple thresholds:")
-        print("=" * 50)
-        
-        for thresh in thresholds:
-            results = self.predict(image_path, threshold=thresh)
-            num_instances = len(np.unique(results['masks'])) - 1
-            print(f"Threshold {thresh:.1f}: {num_instances} instances")
-            if results['scores'] is not None:
-                scores_arr = results['scores'].cpu().numpy() if hasattr(results['scores'], 'cpu') else results['scores']
-                if len(scores_arr) > 0:
-                    print(f"  Scores: {scores_arr}")
-        
-        print("=" * 50)
-        print("\nTip: If all thresholds show 1 instance, your model might need more training.")
-        print("Try visualizing with threshold=0.1 to see if there are any weak predictions.\n")
+    # Input configuration
+    parser.add_argument(
+        "--source",
+        type=str,
+        required=True,
+        help="Input source (image file, video file, directory, or camera index)"
+    )
     
-    def visualize(self, image_path: str, threshold: float = 0.5, save_path: str = None, show_scores: bool = True):
-        """
-        Visualize predictions
+    # Inference parameters
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=1024,
+        help="Inference image size (FastSAM typically uses 1024)"
+    )
+    
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.4,
+        help="Confidence threshold for YOLO detections"
+    )
+    
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.9,
+        help="IoU threshold for NMS in FastSAM"
+    )
+    
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="",
+        help="Device to use for inference (e.g., '0' or 'cpu')"
+    )
+    
+    parser.add_argument(
+        "--retina",
+        action="store_true",
+        help="Use retina masks for higher quality FastSAM output"
+    )
+    
+    # Visualization options
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Display results in a window"
+    )
+    
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        default=True,
+        help="Save inference results"
+    )
+    
+    parser.add_argument(
+        "--no-save",
+        dest="save",
+        action="store_false",
+        help="Don't save inference results"
+    )
+    
+    parser.add_argument(
+        "--save-masks",
+        action="store_true",
+        help="Save individual mask files"
+    )
+    
+    parser.add_argument(
+        "--save-overlay",
+        action="store_true",
+        default=True,
+        help="Save overlay visualization"
+    )
+    
+    parser.add_argument(
+        "--line-width",
+        type=int,
+        default=2,
+        help="Bounding box line width (pixels)"
+    )
+    
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.4,
+        help="Transparency for mask overlay (0.0-1.0)"
+    )
+    
+    # Output configuration
+    parser.add_argument(
+        "--project",
+        type=str,
+        default="runs/combined_inference",
+        help="Project directory for saving results"
+    )
+    
+    parser.add_argument(
+        "--name",
+        type=str,
+        default="exp",
+        help="Experiment name"
+    )
+    
+    parser.add_argument(
+        "--exist-ok",
+        action="store_true",
+        help="Allow overwriting existing experiment"
+    )
+    
+    # Advanced options
+    parser.add_argument(
+        "--max-det",
+        type=int,
+        default=300,
+        help="Maximum number of detections per image"
+    )
+    
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output"
+    )
+    
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Show timing information for each stage"
+    )
+    
+    return parser.parse_args()
+
+
+def get_boxes_from_yolo(yolo_model, image, conf_threshold, device):
+    """
+    Run YOLO detection to get bounding boxes.
+    
+    Args:
+        yolo_model: YOLO model instance
+        image: Input image (numpy array)
+        conf_threshold: Confidence threshold
+        device: Device to run on
         
-        Args:
-            image_path: Path to image
-            threshold: Confidence threshold
-            save_path: Path to save visualization
-            show_scores: Whether to display confidence scores on masks
-        """
-        results = self.predict(image_path, threshold)
+    Returns:
+        boxes: Detected bounding boxes in xyxy format
+        confidences: Confidence scores
+        class_ids: Class IDs
+    """
+    # Run YOLO detection
+    results = yolo_model.predict(
+        image,
+        conf=conf_threshold,
+        device=device,
+        verbose=False
+    )
+    
+    if len(results) == 0 or results[0].boxes is None or len(results[0].boxes) == 0:
+        return None, None, None
+    
+    # Extract boxes, confidences, and class IDs
+    boxes = results[0].boxes.xyxy.cpu().numpy()  # xyxy format
+    confidences = results[0].boxes.conf.cpu().numpy()
+    class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+    
+    return boxes, confidences, class_ids
+
+
+def run_fastsam_with_boxes(fastsam_model, image, boxes, iou_threshold, device, retina=False):
+    """
+    Run FastSAM with box prompts from YOLO detections.
+    
+    Args:
+        fastsam_model: FastSAM model instance
+        image: Input image (numpy array)
+        boxes: Bounding boxes from YOLO in xyxy format
+        iou_threshold: IoU threshold for FastSAM
+        device: Device to run on
+        retina: Use retina masks
         
-        image = results['image']
-        masks = results['masks']
+    Returns:
+        masks: Segmentation masks
+        fastsam_results: Full FastSAM results
+    """
+    # Run FastSAM
+    fastsam_results = fastsam_model(
+        image,
+        device=device,
+        retina_masks=retina,
+        iou=iou_threshold,
+        conf=0.4,
+        verbose=False
+    )
+    
+    if len(fastsam_results) == 0:
+        return None, None
+    
+    # Create prompt processor
+    prompt_process = FastSAMPrompt(image, fastsam_results, device=device)
+    
+    # Use box prompts
+    # Convert boxes to list format expected by FastSAM
+    box_prompts = boxes.tolist() if len(boxes) > 0 else None
+    
+    if box_prompts is None:
+        return None, None
+    
+    # Get masks using box prompts
+    masks = prompt_process.box_prompt(bboxes=box_prompts)
+    
+    return masks, fastsam_results
+
+
+def visualize_results(image, boxes, masks, confidences, class_ids, class_names, 
+                     alpha=0.4, line_width=2):
+    """
+    Visualize combined YOLO + FastSAM results.
+    
+    Args:
+        image: Original image
+        boxes: YOLO bounding boxes
+        masks: FastSAM segmentation masks
+        confidences: Detection confidences
+        class_ids: Class IDs
+        class_names: Class names dictionary
+        alpha: Mask transparency
+        line_width: Box line width
         
-        # Create visualization
-        fig, axes = plt.subplots(1, 2, figsize=(15, 7))
-        
-        # Original image
-        axes[0].imshow(image)
-        axes[0].set_title("Original Image")
-        axes[0].axis('off')
-        
-        # Overlay masks
-        axes[1].imshow(image)
-        
-        # Get unique instance IDs
-        instance_ids = np.unique(masks)
-        instance_ids = instance_ids[instance_ids != 0]  # Remove background
-        
-        if len(instance_ids) > 0:
-            # Color map for instances
-            colors = plt.cm.rainbow(np.linspace(0, 1, len(instance_ids)))
-            
-            # Create a single overlay image with all masks
-            overlay = np.zeros((*masks.shape, 4), dtype=np.float32)
-            
-            for i, instance_id in enumerate(instance_ids):
-                mask = (masks == instance_id).astype(bool)
-                overlay[mask] = [*colors[i][:3], 0.6]  # RGBA
+    Returns:
+        vis_image: Visualization image
+    """
+    vis_image = image.copy()
+    
+    # Generate colors for each detection
+    np.random.seed(42)
+    colors = np.random.randint(0, 255, size=(len(boxes), 3), dtype=np.uint8)
+    
+    # Apply masks
+    if masks is not None and len(masks) > 0:
+        for i, mask in enumerate(masks):
+            if i >= len(colors):
+                break
                 
-                # Add scores if available and requested
-                if show_scores and results['scores'] is not None:
-                    # Find center of mask for text placement
-                    y_coords, x_coords = np.where(mask)
-                    if len(y_coords) > 0:
-                        center_y, center_x = np.mean(y_coords), np.mean(x_coords)
-                        score_val = results['scores'][i].item() if hasattr(results['scores'][i], 'item') else results['scores'][i]
-                        axes[1].text(center_x, center_y, f"{score_val:.2f}", 
-                                   color='white', fontsize=12, weight='bold',
-                                   ha='center', va='center',
-                                   bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
+            color = colors[i].tolist()
             
-            # Display the accumulated overlay
-            axes[1].imshow(overlay)
+            # Convert mask to binary
+            if isinstance(mask, np.ndarray):
+                binary_mask = mask.astype(bool)
+            else:
+                binary_mask = mask.cpu().numpy().astype(bool)
+            
+            # Apply colored mask
+            for c in range(3):
+                vis_image[:, :, c] = np.where(
+                    binary_mask,
+                    vis_image[:, :, c] * (1 - alpha) + alpha * color[c],
+                    vis_image[:, :, c]
+                )
+    
+    # Draw bounding boxes and labels
+    if boxes is not None and len(boxes) > 0:
+        for i, (box, conf, cls_id) in enumerate(zip(boxes, confidences, class_ids)):
+            x1, y1, x2, y2 = box.astype(int)
+            color = colors[i].tolist()
+            
+            # Draw box
+            cv2.rectangle(vis_image, (x1, y1), (x2, y2), color, line_width)
+            
+            # Draw label
+            class_name = class_names.get(cls_id, f"class_{cls_id}")
+            label = f"{class_name} {conf:.2f}"
+            
+            # Get label size
+            (label_w, label_h), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            
+            # Draw label background
+            cv2.rectangle(
+                vis_image,
+                (x1, y1 - label_h - baseline - 5),
+                (x1 + label_w, y1),
+                color,
+                -1
+            )
+            
+            # Draw label text
+            cv2.putText(
+                vis_image,
+                label,
+                (x1, y1 - baseline - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1
+            )
+    
+    return vis_image
+
+
+def process_image(image_path, yolo_model, fastsam_model, args, save_dir=None):
+    """
+    Process a single image with YOLO + FastSAM.
+    
+    Args:
+        image_path: Path to image file
+        yolo_model: YOLO model
+        fastsam_model: FastSAM model
+        args: CLI arguments
+        save_dir: Directory to save results
+        
+    Returns:
+        vis_image: Visualization image
+        stats: Processing statistics
+    """
+    stats = {
+        'yolo_time': 0,
+        'fastsam_time': 0,
+        'total_time': 0,
+        'num_detections': 0
+    }
+    
+    start_total = time.time()
+    
+    # Read image
+    image = cv2.imread(str(image_path))
+    if image is None:
+        print(f"Error reading image: {image_path}")
+        return None, stats
+    
+    original_image = image.copy()
+    
+    # Step 1: YOLO Detection
+    if args.benchmark:
+        start = time.time()
+    
+    boxes, confidences, class_ids = get_boxes_from_yolo(
+        yolo_model, image, args.conf, args.device
+    )
+    
+    if args.benchmark:
+        stats['yolo_time'] = time.time() - start
+    
+    if boxes is None or len(boxes) == 0:
+        print(f"No detections found in {image_path.name}")
+        stats['total_time'] = time.time() - start_total
+        return original_image, stats
+    
+    stats['num_detections'] = len(boxes)
+    
+    # Step 2: FastSAM with box prompts
+    if args.benchmark:
+        start = time.time()
+    
+    masks, fastsam_results = run_fastsam_with_boxes(
+        fastsam_model, image, boxes, args.iou, args.device, args.retina
+    )
+    
+    if args.benchmark:
+        stats['fastsam_time'] = time.time() - start
+    
+    # Step 3: Visualize results
+    class_names = yolo_model.names if hasattr(yolo_model, 'names') else {}
+    
+    vis_image = visualize_results(
+        original_image, boxes, masks, confidences, class_ids,
+        class_names, args.alpha, args.line_width
+    )
+    
+    stats['total_time'] = time.time() - start_total
+    
+    # Save results
+    if save_dir and args.save:
+        # Save visualization
+        if args.save_overlay:
+            save_path = save_dir / f"{image_path.stem}_result.jpg"
+            cv2.imwrite(str(save_path), vis_image)
+        
+        # Save individual masks
+        if args.save_masks and masks is not None:
+            masks_dir = save_dir / "masks" / image_path.stem
+            masks_dir.mkdir(parents=True, exist_ok=True)
+            
+            for i, mask in enumerate(masks):
+                if isinstance(mask, np.ndarray):
+                    mask_img = (mask * 255).astype(np.uint8)
+                else:
+                    mask_img = (mask.cpu().numpy() * 255).astype(np.uint8)
+                
+                mask_path = masks_dir / f"mask_{i}.png"
+                cv2.imwrite(str(mask_path), mask_img)
+    
+    return vis_image, stats
+
+
+def process_video(video_path, yolo_model, fastsam_model, args, save_dir=None):
+    """
+    Process a video file with YOLO + FastSAM.
+    
+    Args:
+        video_path: Path to video file
+        yolo_model: YOLO model
+        fastsam_model: FastSAM model
+        args: CLI arguments
+        save_dir: Directory to save results
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    
+    if not cap.isOpened():
+        print(f"Error opening video: {video_path}")
+        return
+    
+    # Get video properties
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f"Processing video: {video_path.name}")
+    print(f"Resolution: {width}x{height}, FPS: {fps}, Total frames: {total_frames}")
+    
+    # Setup video writer
+    writer = None
+    if save_dir and args.save:
+        output_path = save_dir / f"{video_path.stem}_result.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    
+    frame_count = 0
+    total_detections = 0
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Process frame
+            boxes, confidences, class_ids = get_boxes_from_yolo(
+                yolo_model, frame, args.conf, args.device
+            )
+            
+            if boxes is not None and len(boxes) > 0:
+                total_detections += len(boxes)
+                
+                # Run FastSAM
+                masks, _ = run_fastsam_with_boxes(
+                    fastsam_model, frame, boxes, args.iou, args.device, args.retina
+                )
+                
+                # Visualize
+                class_names = yolo_model.names if hasattr(yolo_model, 'names') else {}
+                vis_frame = visualize_results(
+                    frame, boxes, masks, confidences, class_ids,
+                    class_names, args.alpha, args.line_width
+                )
+            else:
+                vis_frame = frame
+            
+            # Save frame
+            if writer:
+                writer.write(vis_frame)
+            
+            # Show frame
+            if args.show:
+                cv2.imshow('YOLO + FastSAM Inference', vis_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            
+            frame_count += 1
+            if frame_count % 30 == 0:
+                print(f"Processed {frame_count}/{total_frames} frames...")
+    
+    finally:
+        cap.release()
+        if writer:
+            writer.release()
+        if args.show:
+            cv2.destroyAllWindows()
+    
+    print(f"Video processing complete: {frame_count} frames, {total_detections} total detections")
+
+
+def main():
+    """Main inference function."""
+    args = parse_args()
+    
+    # Print configuration
+    print("=" * 70)
+    print("YOLO + FastSAM Combined Inference")
+    print("=" * 70)
+    print(f"YOLO Model: {args.yolo_model}")
+    print(f"FastSAM Model: {args.fastsam_model}")
+    print(f"Source: {args.source}")
+    print(f"Image size: {args.imgsz}")
+    print(f"Confidence threshold: {args.conf}")
+    print(f"IoU threshold: {args.iou}")
+    print(f"Device: {args.device if args.device else 'auto'}")
+    print(f"Mask alpha: {args.alpha}")
+    print(f"Output: {args.project}/{args.name}")
+    print("=" * 70)
+    
+    # Verify model files exist
+    yolo_path = Path(args.yolo_model)
+    fastsam_path = Path(args.fastsam_model)
+    
+    if not yolo_path.exists():
+        raise FileNotFoundError(f"YOLO model file not found: {args.yolo_model}")
+    if not fastsam_path.exists():
+        raise FileNotFoundError(f"FastSAM model file not found: {args.fastsam_model}")
+    
+    # Load models
+    print(f"\nLoading YOLO model: {args.yolo_model}")
+    yolo_model = YOLO(args.yolo_model)
+    print("YOLO model loaded!")
+    
+    print(f"Loading FastSAM model: {args.fastsam_model}")
+    fastsam_model = FastSAM(args.fastsam_model)
+    print("FastSAM model loaded!")
+    
+    # Setup save directory
+    save_dir = None
+    if args.save:
+        save_dir = Path(args.project) / args.name
+        
+        # Handle existing directory
+        if save_dir.exists() and not args.exist_ok:
+            # Find next available number
+            counter = 1
+            while (Path(args.project) / f"{args.name}{counter}").exists():
+                counter += 1
+            save_dir = Path(args.project) / f"{args.name}{counter}"
+        
+        save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nResults will be saved to: {save_dir}")
+    
+    # Check source type
+    source_path = Path(args.source)
+    
+    # Check if source is camera index
+    if args.source.isdigit():
+        print("\nCamera input not yet implemented for combined inference")
+        return
+    
+    if not source_path.exists():
+        raise FileNotFoundError(f"Source not found: {args.source}")
+    
+    # Process based on source type
+    print("\nStarting inference...\n")
+    
+    if source_path.is_file():
+        # Check if video or image
+        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv'}
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+        
+        if source_path.suffix.lower() in video_extensions:
+            # Process video
+            process_video(source_path, yolo_model, fastsam_model, args, save_dir)
+        elif source_path.suffix.lower() in image_extensions:
+            # Process single image
+            vis_image, stats = process_image(
+                source_path, yolo_model, fastsam_model, args, save_dir
+            )
+            
+            if vis_image is not None:
+                print(f"\nResults for {source_path.name}:")
+                print(f"  Detections: {stats['num_detections']}")
+                if args.benchmark:
+                    print(f"  YOLO time: {stats['yolo_time']:.3f}s")
+                    print(f"  FastSAM time: {stats['fastsam_time']:.3f}s")
+                    print(f"  Total time: {stats['total_time']:.3f}s")
+                
+                if args.show:
+                    cv2.imshow('Result', vis_image)
+                    cv2.waitKey(0)
+                    cv2.destroyAllWindows()
         else:
-            # No instances detected - add warning
-            axes[1].text(0.5, 0.5, 'No instances detected\nTry lowering threshold', 
-                       transform=axes[1].transAxes,
-                       ha='center', va='center', fontsize=14, color='red',
-                       bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+            print(f"Unsupported file format: {source_path.suffix}")
+            return
+    
+    elif source_path.is_dir():
+        # Process directory of images
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+        image_files = [f for f in source_path.iterdir() 
+                      if f.suffix.lower() in image_extensions]
         
-        axes[1].set_title(f"Predictions ({len(instance_ids)} instances, threshold={threshold})")
-        axes[1].axis('off')
+        if not image_files:
+            print("No valid images found in directory!")
+            return
         
-        plt.tight_layout()
+        print(f"Found {len(image_files)} images")
         
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved visualization to {save_path}")
+        all_stats = []
+        for i, img_path in enumerate(image_files, 1):
+            print(f"\n[{i}/{len(image_files)}] Processing {img_path.name}...")
+            
+            vis_image, stats = process_image(
+                img_path, yolo_model, fastsam_model, args, save_dir
+            )
+            
+            if vis_image is not None:
+                all_stats.append(stats)
+                print(f"  Detections: {stats['num_detections']}")
+                if args.benchmark:
+                    print(f"  Time: {stats['total_time']:.3f}s")
         
-        plt.show()
-        
-        return results
+        # Print summary
+        if all_stats:
+            print("\n" + "=" * 70)
+            print("Inference Summary")
+            print("=" * 70)
+            print(f"Total images processed: {len(all_stats)}")
+            print(f"Total detections: {sum(s['num_detections'] for s in all_stats)}")
+            if args.benchmark:
+                avg_yolo = np.mean([s['yolo_time'] for s in all_stats])
+                avg_fastsam = np.mean([s['fastsam_time'] for s in all_stats])
+                avg_total = np.mean([s['total_time'] for s in all_stats])
+                print(f"Average YOLO time: {avg_yolo:.3f}s")
+                print(f"Average FastSAM time: {avg_fastsam:.3f}s")
+                print(f"Average total time: {avg_total:.3f}s")
+            print("=" * 70)
+    
+    if save_dir:
+        print(f"\nResults saved to: {save_dir}")
+    
+    print("\nInference completed!")
 
-
-# ============= Usage =============
 
 if __name__ == "__main__":
-    # Option 1: Load from final_model (has both model and processor)
-    inferencer = Mask2FormerInference(
-        model_path="./mask2former-overlay-segmentation/final_model"
-    )
-    
-    # Option 2: Load from checkpoint (need to specify processor path separately)
-    # inferencer = Mask2FormerInference(
-    #     model_path="./mask2former-overlay-segmentation/checkpoint-2000",
-    #     processor_path="./mask2former-overlay-segmentation/final_model"  # or the original pretrained model
-    # )
-    
-    # Option 3: Load checkpoint with original pretrained processor
-    # inferencer = Mask2FormerInference(
-    #     model_path="./mask2former-overlay-segmentation/checkpoint-2000",
-    #     processor_path="facebook/mask2former-swin-small-coco-instance"
-    # )
-    
-    # DEBUGGING: If getting only 1 instance, try multiple thresholds
-    print("\n=== DIAGNOSTIC: Testing multiple thresholds ===")
-    inferencer.predict_with_multiple_thresholds("test_image.png")
-    
-    # Run inference with lower threshold (try 0.1-0.3 for early checkpoints)
-    print("\n=== Visualizing with threshold=0.3 ===")
-    results = inferencer.visualize(
-        image_path="test_image.png",
-        threshold=0.3,  # Lower threshold for early checkpoints
-        save_path="prediction.png"
-    )
-    
-    print(f"\nFinal count: {len(np.unique(results['masks'])) - 1} instances")
-    print("\nIf you're still getting 1 instance:")
-    print("1. Your model needs more training (2000 steps might be too early)")
-    print("2. Check training loss - is it decreasing?")
-    print("3. Verify your training data has multiple instances per image")
-    print("4. Try loading a later checkpoint (e.g., checkpoint-5000 or final_model)")
+    main()
