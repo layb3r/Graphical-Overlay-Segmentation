@@ -213,6 +213,7 @@ def run_efficient_sam_with_boxes(sam_model, image, boxes, device):
     """
     Run EfficientSAM with box prompts from YOLO detections.
     Uses box encoding directly for efficient segmentation.
+    Processes all boxes in a single batched inference call.
     
     Args:
         sam_model: EfficientSAM model instance
@@ -237,11 +238,12 @@ def run_efficient_sam_with_boxes(sam_model, image, boxes, device):
     image_tensor = image_tensor.to(device)
     sam_model = sam_model.to(device)
     
-    selected_masks = []
-    predicted_ious = []
+    # Prepare all boxes for batched inference
+    num_boxes = len(boxes)
+    all_points = []
+    valid_indices = []
     
-    # Process each box
-    for box in boxes:
+    for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box.astype(float)
         
         # Ensure coordinates are within image bounds
@@ -252,48 +254,76 @@ def run_efficient_sam_with_boxes(sam_model, image, boxes, device):
         
         # Skip invalid boxes
         if x2 <= x1 or y2 <= y1:
-            mask = np.zeros((orig_h, orig_w), dtype=bool)
-            selected_masks.append(mask)
-            predicted_ious.append(0.0)
             continue
         
-        # Convert box to two corner points for EfficientSAM
-        # Using top-left and bottom-right corners
-        input_points = torch.tensor([[[[x1, y1], [x2, y2]]]]).to(device)
-        input_labels = torch.tensor([[[2, 3]]]).to(device)  # 2 and 3 indicate box corners
-        
-        try:
-            # Run EfficientSAM inference
-            with torch.no_grad():
-                predicted_logits, predicted_iou = sam_model(
-                    image_tensor[None, ...],
-                    input_points,
-                    input_labels,
-                )
-            
-            # Sort by IoU and get best mask
-            sorted_ids = torch.argsort(predicted_iou, dim=-1, descending=True)
-            predicted_iou = torch.take_along_dim(predicted_iou, sorted_ids, dim=2)
-            predicted_logits = torch.take_along_dim(
-                predicted_logits, sorted_ids[..., None, None], dim=2
+        # Add box corner points (top-left and bottom-right)
+        all_points.append([[x1, y1], [x2, y2]])
+        valid_indices.append(i)
+    
+    # Handle case with no valid boxes
+    if len(all_points) == 0:
+        return [np.zeros((orig_h, orig_w), dtype=bool) for _ in range(num_boxes)], [0.0] * num_boxes
+    
+    # Convert to tensors - shape: [1, num_valid_boxes, 2, 2]
+    input_points = torch.tensor([all_points], dtype=torch.float32).to(device)
+    # Labels [2, 3] indicate box corners - shape: [1, num_valid_boxes, 2]
+    input_labels = torch.tensor([[[2, 3]] * len(all_points)]).to(device)
+    
+    try:
+        # Run EfficientSAM inference on ALL boxes at once
+        with torch.no_grad():
+            predicted_logits, predicted_iou = sam_model(
+                image_tensor[None, ...],
+                input_points,
+                input_labels,
             )
+        
+        # Extract masks for each box
+        selected_masks = [None] * num_boxes
+        predicted_ious = [0.0] * num_boxes
+        
+        for i, box_idx in enumerate(valid_indices):
+            # Sort by IoU and get best mask for this box
+            sorted_ids = torch.argsort(predicted_iou[0, i], dim=-1, descending=True)
+            best_mask_idx = sorted_ids[0]
             
             # Get the mask with highest IoU
-            mask = torch.ge(predicted_logits[0, 0, 0, :, :], 0).cpu().detach().numpy()
-            iou = predicted_iou[0, 0, 0].cpu().item()
+            mask = torch.ge(predicted_logits[0, i, best_mask_idx, :, :], 0).cpu().detach().numpy()
+            iou = predicted_iou[0, i, best_mask_idx].cpu().item()
             
-            selected_masks.append(mask.astype(bool))
-            predicted_ious.append(iou)
+            selected_masks[box_idx] = mask.astype(bool)
+            predicted_ious[box_idx] = iou
+        
+        # Fill in invalid boxes with empty masks
+        for i in range(num_boxes):
+            if selected_masks[i] is None:
+                selected_masks[i] = np.zeros((orig_h, orig_w), dtype=bool)
+        
+        return selected_masks, predicted_ious
+        
+    except Exception as e:
+        print(f"Warning: EfficientSAM batched inference failed: {e}")
+        print("Falling back to per-box processing...")
+        
+        # Fallback: create simple box masks
+        selected_masks = []
+        predicted_ious = []
+        
+        for box in boxes:
+            x1, y1, x2, y2 = box.astype(float)
+            x1 = max(0, min(int(x1), orig_w - 1))
+            x2 = max(0, min(int(x2), orig_w - 1))
+            y1 = max(0, min(int(y1), orig_h - 1))
+            y2 = max(0, min(int(y2), orig_h - 1))
             
-        except Exception as e:
-            print(f"Warning: EfficientSAM failed for box {box}: {e}")
-            # Fallback: create simple box mask
             mask = np.zeros((orig_h, orig_w), dtype=bool)
-            mask[int(y1):int(y2), int(x1):int(x2)] = True
+            if x2 > x1 and y2 > y1:
+                mask[y1:y2, x1:x2] = True
+            
             selected_masks.append(mask)
             predicted_ious.append(0.0)
-    
-    return selected_masks, predicted_ious
+        
+        return selected_masks, predicted_ious
 
 
 def load_efficient_sam_model(model_type, model_path, device):
@@ -942,7 +972,7 @@ def main():
             print(f"\n[{i}/{len(image_files)}] Processing {img_path.name}...")
             
             vis_image, stats = process_image(
-                img_path, yolo_model, sam_model, args, save_dir
+                img_path, yolo_model, sam_model, args, device, save_dir
             )
             
             if vis_image is not None:
