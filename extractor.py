@@ -15,7 +15,7 @@ from PIL import Image
 import cv2
 from torchvision import transforms
 from ultralytics import YOLO
-from efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
+from .efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
 
 from .declare import FrameData
 from .helpers import bbox_from_mask, mask_stats
@@ -157,17 +157,18 @@ class FrameExtractor:
         *,
         min_area_keep: int,
     ) -> FrameData:
-        # Convert to RGB array and resize
-        rgb = resize_rgb(to_uint8_rgb(img), hw_ref)
+        original_rgb = to_uint8_rgb(img)
+        orig_h, orig_w = original_rgb.shape[:2]
+        
+        rgb = resize_rgb(original_rgb, hw_ref)
         H, W = rgb.shape[:2]
         gray = gray_tensor(rgb, (H, W), self.device)
         
-        # Convert RGB to BGR for OpenCV/YOLO
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        original_bgr = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2BGR)
         
-        # Step 1: YOLO Detection
+        # Step 1: YOLO Detection on original image
         yolo_results = self.yolo_model.predict(
-            bgr,
+            original_bgr,
             conf=self.conf,
             device=str(self.device),
             verbose=False
@@ -182,9 +183,19 @@ class FrameExtractor:
             bbox: List[Optional[Tuple[int, int, int, int]]] = []
             return FrameData(name=name, gray=gray, masks=masks, area=area, centroid=cent, bbox=bbox)
         
-        boxes = yolo_results[0].boxes.xyxy.cpu().numpy()  # xyxy format
+        boxes = yolo_results[0].boxes.xyxy.cpu().numpy()  # xyxy format in original coordinates
         
-        # Step 2: EfficientSAM with box prompts (batched)
+        # Scale boxes to resized dimensions if needed
+        if (orig_h, orig_w) != (H, W):
+            scale_x = W / orig_w
+            scale_y = H / orig_h
+            boxes[:, [0, 2]] *= scale_x  # x1, x2
+            boxes[:, [1, 3]] *= scale_y  # y1, y2
+        
+        # Convert resized RGB to BGR for EfficientSAM
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        
+        # Step 2: EfficientSAM with scaled box prompts (batched)
         mask_list = self._run_efficient_sam_batched(bgr, boxes)
         
         # Convert to torch tensor [N, H, W]
