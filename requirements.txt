@@ -3,4 +3,4 @@ numpy
 opencv-python
 torch
 torchvision
-efficient-sam
+Pillow

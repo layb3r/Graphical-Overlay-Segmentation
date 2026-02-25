@@ -15,7 +15,7 @@ from PIL import Image
 import cv2
 from torchvision import transforms
 from ultralytics import YOLO
-from .efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
+from ..efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
 
 from .declare import FrameData
 from .helpers import bbox_from_mask, mask_stats
